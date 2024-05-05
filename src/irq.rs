@@ -1,5 +1,5 @@
 use anyhow::Result;
-use log::info;
+use log::{debug, info};
 use signal_hook::{consts::SIGHUP, iterator::Signals, low_level};
 use std::{
     sync::{Arc, RwLock, Weak},
@@ -69,11 +69,12 @@ impl IRQContext {
                 }
             }
         });
+        debug!("terminated");
         Ok(())
     }
     pub fn shutdown(&self) -> Result<()> {
-        // TODO:
-        info!("shutdown");
+        raise_irq(SIGHUP)?;
+        // TODO: wait for the thread to finish
         Ok(())
     }
 }
