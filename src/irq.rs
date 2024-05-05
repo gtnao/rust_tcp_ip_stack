@@ -1,6 +1,10 @@
 use anyhow::Result;
 use log::{debug, info};
-use signal_hook::{consts::SIGHUP, iterator::Signals, low_level};
+use signal_hook::{
+    consts::{SIGHUP, SIGUSR1},
+    iterator::Signals,
+    low_level,
+};
 use std::{
     sync::{Arc, RwLock, Weak},
     thread,
@@ -49,7 +53,7 @@ impl IRQContext {
     pub fn run(&self) -> Result<()> {
         let available_irqs =
             (Self::AVAILABLE_IRQ_MIN..Self::AVAILABLE_IRQ_MAX).collect::<Vec<i32>>();
-        let mut signal_list = vec![SIGHUP];
+        let mut signal_list = vec![SIGHUP, SIGUSR1];
         signal_list.extend(&available_irqs);
         let mut signals = Signals::new(&signal_list)?;
         let net_device_context_clone = self.net_device_context.upgrade();
@@ -58,6 +62,10 @@ impl IRQContext {
             for signal in signals.forever() {
                 if signal == SIGHUP {
                     break;
+                } else if signal == SIGUSR1 {
+                    if let Some(net_device_context) = &net_device_context_clone {
+                        net_device_context.software_isr();
+                    }
                 } else {
                     for irq_entry in irq_entries_clone.read().unwrap().iter() {
                         if irq_entry.read().unwrap().irq == signal {

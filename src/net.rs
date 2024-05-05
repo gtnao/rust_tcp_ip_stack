@@ -5,17 +5,21 @@ use std::{
 
 use anyhow::Result;
 use log::{debug, error, info};
+use signal_hook::consts::SIGUSR1;
 
 use crate::irq::{raise_irq, IRQContext};
 
 const DUMMY_IRQ: i32 = 35;
 const LOOPBACK_IRQ: i32 = 36;
 
+pub const NET_PROTOCOL_IP: u16 = 0x0800;
+
 pub struct NetDeviceContext {
     current_index: AtomicU32,
     net_devices: RwLock<Vec<RwLock<NetDevice>>>,
     irq_device_map: RwLock<HashMap<i32, u32>>,
     irq_context: RwLock<IRQContext>,
+    protocols: RwLock<Vec<NetProtocol>>,
 }
 
 impl NetDeviceContext {
@@ -25,6 +29,7 @@ impl NetDeviceContext {
             net_devices: RwLock::new(Vec::new()),
             irq_device_map: RwLock::new(HashMap::new()),
             irq_context: RwLock::new(IRQContext::new()),
+            protocols: RwLock::new(Vec::new()),
         });
         context
             .irq_context
@@ -41,7 +46,11 @@ impl NetDeviceContext {
         info!("initialized");
         Ok(())
     }
-    pub fn register(&self, net_device_type: NetDeviceType) -> Result<()> {
+    pub fn register(
+        &self,
+        net_device_type: NetDeviceType,
+        context: Arc<NetDeviceContext>,
+    ) -> Result<()> {
         let index = self.current_index.load(std::sync::atomic::Ordering::SeqCst);
         let name = format!("net{}", index);
         match net_device_type {
@@ -66,13 +75,24 @@ impl NetDeviceContext {
                     .insert(LOOPBACK_IRQ, index);
             }
         }
-        let net_device = NetDevice::new(name, net_device_type);
+        let net_device = NetDevice::new(name, net_device_type, context);
         self.net_devices
             .write()
             .map_err(|_| anyhow::anyhow!("Failed to write lock"))?
             .push(RwLock::new(net_device));
         self.current_index
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+    pub fn register_protocol(&self, protocol_type: u16) -> Result<()> {
+        let protocol = NetProtocol {
+            protocol_type,
+            queue: Mutex::new(Vec::new()),
+        };
+        self.protocols
+            .write()
+            .map_err(|_| anyhow::anyhow!("Failed to write lock"))?
+            .push(protocol);
         Ok(())
     }
     pub fn run(&self) -> Result<()> {
@@ -113,7 +133,7 @@ impl NetDeviceContext {
             .shutdown()?;
         Ok(())
     }
-    pub fn transmit(&self, index: u32, data: String) -> Result<()> {
+    pub fn transmit(&self, index: u32, net_protocol_type: u16, data: String) -> Result<()> {
         if let Some(net_device) = self
             .net_devices
             .read()
@@ -123,7 +143,7 @@ impl NetDeviceContext {
             net_device
                 .write()
                 .map_err(|_| anyhow::anyhow!("Failed to write lock"))?
-                .transmit(data)?;
+                .transmit(net_protocol_type, data)?;
         }
         Ok(())
     }
@@ -148,20 +168,71 @@ impl NetDeviceContext {
         }
         Ok(())
     }
+    pub fn software_isr(&self) -> Result<()> {
+        let protocols = self
+            .protocols
+            .read()
+            .map_err(|_| anyhow::anyhow!("Failed to read lock"))?;
+        for protocol in &*protocols {
+            while let Some(data) = protocol
+                .queue
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Failed to lock"))?
+                .pop()
+            {
+                match protocol.protocol_type {
+                    NET_PROTOCOL_IP => {
+                        debug!("software isr, protocol=IP, data={}", data);
+                    }
+                    _ => {
+                        error!(
+                            "software isr, unknown protocol, type={}",
+                            protocol.protocol_type
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+    pub fn input(&self, protocol_type: u16, data: String) -> Result<()> {
+        let protocols = self
+            .protocols
+            .read()
+            .map_err(|_| anyhow::anyhow!("Failed to read lock"))?;
+        for protocol in &*protocols {
+            if protocol.protocol_type == protocol_type {
+                protocol
+                    .queue
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("Failed to lock"))?
+                    .push(data);
+                raise_irq(SIGUSR1)?;
+                break;
+            }
+        }
+        Ok(())
+    }
 }
 
 struct NetDevice {
     name: String,
     net_device_type: NetDeviceType,
+    net_device_context: Arc<NetDeviceContext>,
     flags: u16,
 }
 impl NetDevice {
     const FLAG_UP: u16 = 0x0001;
 
-    pub fn new(name: String, net_device_type: NetDeviceType) -> NetDevice {
+    pub fn new(
+        name: String,
+        net_device_type: NetDeviceType,
+        net_device_context: Arc<NetDeviceContext>,
+    ) -> NetDevice {
         NetDevice {
             name,
             net_device_type,
+            net_device_context,
             flags: 0,
         }
     }
@@ -191,7 +262,7 @@ impl NetDevice {
         info!("dev={}, state={}", self.name, self.state());
         Ok(())
     }
-    pub fn transmit(&mut self, data: String) -> Result<()> {
+    pub fn transmit(&mut self, net_protocol_type: u16, data: String) -> Result<()> {
         if !self.is_up() {
             error!("not opened, dev={}", self.name);
             return Err(anyhow::anyhow!("not opened"));
@@ -219,7 +290,10 @@ impl NetDevice {
                     .queue
                     .lock()
                     .map_err(|_| anyhow::anyhow!("Failed to lock"))?;
-                queue.push(data);
+                queue.push(LoopbackNetDeviceQueueEntry {
+                    net_protocol_type,
+                    data,
+                });
                 debug!(
                     "queue pushed (num:{}), dev={}, type={:?}",
                     queue.len(),
@@ -240,30 +314,20 @@ impl NetDevice {
                     .queue
                     .lock()
                     .map_err(|_| anyhow::anyhow!("Failed to lock"))?;
-                // pop all
-                while let Some(data) = queue.pop() {
+                while let Some(entry) = queue.pop() {
                     debug!(
                         "queue popped (num:{}), dev={}, type={:?}, len={}",
                         queue.len(),
                         self.name,
-                        self.net_device_type,
-                        data.len()
+                        entry.net_protocol_type,
+                        entry.data.len()
                     );
-                    debug!("data={}", data);
-                    self.input(data)?;
+                    debug!("data={}", entry.data);
+                    self.net_device_context
+                        .input(entry.net_protocol_type, entry.data)?;
                 }
             }
         }
-        Ok(())
-    }
-    fn input(&self, data: String) -> Result<()> {
-        debug!(
-            "dev={}, type={:?}, len={}",
-            self.name,
-            self.net_device_type,
-            data.len()
-        );
-        debug!("data={}", data);
         Ok(())
     }
     fn mtu(&self) -> u16 {
@@ -291,9 +355,8 @@ pub enum NetDeviceType {
 }
 
 #[derive(Debug)]
-
 pub struct LoopbackNetDevice {
-    queue: Mutex<Vec<String>>,
+    queue: Mutex<Vec<LoopbackNetDeviceQueueEntry>>,
 }
 impl Default for LoopbackNetDevice {
     fn default() -> Self {
@@ -306,4 +369,14 @@ impl LoopbackNetDevice {
     pub fn new() -> LoopbackNetDevice {
         Self::default()
     }
+}
+#[derive(Debug)]
+struct LoopbackNetDeviceQueueEntry {
+    net_protocol_type: u16,
+    data: String,
+}
+
+struct NetProtocol {
+    protocol_type: u16,
+    queue: Mutex<Vec<String>>,
 }
